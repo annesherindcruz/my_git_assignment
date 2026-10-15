@@ -12,10 +12,16 @@ let gameOver = false;
 let started = false;
 let selectedCat = null;
 let spawnTimeoutId = null;
+let gameOverTimeoutId = null;
 let flashAlpha = 0;
+let shakeTime = 0;
 let comboCount = 0;
 let lastSliceTime = 0;
 const COMBO_WINDOW = 500;
+let lastFrameTime = performance.now();
+
+// mocking rat popup (appears when you slash a bomb)
+let mockRat = null;
 
 // background state
 let bgTime = 0;
@@ -24,15 +30,17 @@ let cityLayers = [];
 let sunCanvas = null;
 let bgMemes = [];
 let bgMemeTimer = 0;
+let bubbles = [];
+let seaPlants = [];
 
-// ---- DIFFICULTY ----
+// ---- DIFFICULTY / LEVELS ----
 
-const LEVEL_DURATION = 15000;
-let gameStartTime = 0;
+const LEVEL_DURATION = 15000;   // ms of level progress needed per level
+let levelClock = 0;             // level progress in ms (time + bonus fish)
 let currentLevel = 0;
 
 function getLevel() {
-  return Math.floor((Date.now() - gameStartTime) / LEVEL_DURATION);
+  return Math.floor(levelClock / LEVEL_DURATION);
 }
 
 function getSpawnDelay() {
@@ -42,6 +50,16 @@ function getSpawnDelay() {
 function getBombChance() {
   return Math.min(0.07 + currentLevel * 0.01, 0.16);
 }
+
+// ---- BONUS ROUND (FISH FRENZY) STATE ----
+
+const BONUS_DURATION = 12000;    // ms
+const BONUS_FORCE_MS = 35000;    // guarantee a golden fish after this long
+const FISH_LEVEL_BOOST = 1500;   // ms of level progress per fish (10%)
+let bonus = { active: false, timeLeft: 0, caught: 0, points: 0, spawnTimer: 0 };
+let bonusFade = 0;               // 0 = normal scene, 1 = fully underwater
+let timeSinceBonus = 0;
+let pendingBonus = false;
 
 // ---- CANVAS SIZING ----
 
@@ -99,6 +117,22 @@ function playLevelUpSound() {
   playTone({ freq: 500, duration: 0.1, type: "triangle", volume: 0.2 });
   setTimeout(() => playTone({ freq: 700, duration: 0.1, type: "triangle", volume: 0.2 }), 100);
   setTimeout(() => playTone({ freq: 1000, duration: 0.15, type: "triangle", volume: 0.2 }), 200);
+}
+function playBonusStartSound() {
+  [600, 800, 1000, 1300].forEach((f, i) => {
+    setTimeout(() => playTone({ freq: f, duration: 0.12, type: "triangle", volume: 0.2 }), i * 90);
+  });
+}
+function playFishSound() {
+  playTone({ freq: 500, freqEnd: 1100, duration: 0.09, type: "sine", volume: 0.18 });
+}
+// squeaky rat laugh: "hee-hee-hee-hee"
+function playMockSound() {
+  [0, 130, 260, 390].forEach((delay, i) => {
+    setTimeout(() => {
+      playTone({ freq: 1500 + (i % 2) * 300, freqEnd: 900, duration: 0.1, type: "triangle", volume: 0.16 });
+    }, delay);
+  });
 }
 
 // ---- PIXEL SPRITES (flat + 3D extruded) ----
@@ -261,8 +295,11 @@ const CAT_COMMENTS = [
   "no thoughts, head empty, only claws",
   "These rats don't stand a chance.",
   "*knocks bomb off the table*",
-  "Watch out for bombs!",
-  "i can has cheezburger?"
+  "Bombs cost a life now!",
+  "i can has cheezburger?",
+  "Golden fish = bonus splash time!",
+  "fish? i mean... for science.",
+  "Slice a bomb and a rat will laugh at you..."
 ];
 
 function drawMascot() {
@@ -360,6 +397,28 @@ function buildBackground() {
   ];
 
   buildSun();
+
+  // underwater scene pieces
+  bubbles = [];
+  for (let i = 0; i < 38; i++) {
+    bubbles.push({
+      x: Math.random() * w,
+      r: 3 + Math.random() * 9,
+      speed: 25 + Math.random() * 50,
+      offset: Math.random() * h
+    });
+  }
+
+  seaPlants = [];
+  for (let x = 20; x < w; x += 55 + Math.random() * 45) {
+    seaPlants.push({
+      x,
+      h: h * (0.12 + Math.random() * 0.16),
+      phase: Math.random() * 6,
+      color: Math.random() < 0.5 ? "#3fcf8e" : "#2eb87a",
+      coral: Math.random() < 0.3
+    });
+  }
 }
 
 function drawBuilding(b, x, horizonY, layer) {
@@ -405,7 +464,6 @@ function drawFloor(horizonY) {
   ctx.fillStyle = g;
   ctx.fillRect(0, horizonY, w, h - horizonY);
 
-  // horizontal lines rushing toward the camera
   const N = 12;
   const flow = (bgTime * 0.35) % 1;
   ctx.lineWidth = 2;
@@ -419,7 +477,6 @@ function drawFloor(horizonY) {
     ctx.stroke();
   }
 
-  // vertical lines converging at the horizon
   const cx = w / 2;
   ctx.strokeStyle = "rgba(255,255,255,0.35)";
   for (let k = -14; k <= 14; k++) {
@@ -429,7 +486,6 @@ function drawFloor(horizonY) {
     ctx.stroke();
   }
 
-  // glowing horizon line
   const glow = ctx.createLinearGradient(0, horizonY - 8, 0, horizonY + 16);
   glow.addColorStop(0, "rgba(255,255,255,0)");
   glow.addColorStop(0.4, "rgba(255,255,255,0.8)");
@@ -466,6 +522,87 @@ function drawBackground() {
   drawCity(cityLayers[0], horizonY);
   drawCity(cityLayers[1], horizonY);
   drawFloor(horizonY);
+}
+
+// ---- UNDERWATER BACKGROUND (bonus round) ----
+
+function drawUnderwater() {
+  const w = canvas.width;
+  const h = canvas.height;
+
+  const g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, "#8ff0ff");
+  g.addColorStop(0.45, "#2f9be8");
+  g.addColorStop(1, "#14307f");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  for (let i = 0; i < 6; i++) {
+    const x = (i / 6) * w + Math.sin(bgTime * 0.4 + i * 1.7) * 50;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x + 80, 0);
+    ctx.lineTo(x + 260, h);
+    ctx.lineTo(x + 120, h);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  ctx.lineWidth = 2;
+  for (const b of bubbles) {
+    const by = h + 20 - ((bgTime * b.speed + b.offset) % (h + 40));
+    const bx = b.x + Math.sin(bgTime + b.offset) * 12;
+    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.beginPath();
+    ctx.arc(bx, by, b.r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.beginPath();
+    ctx.arc(bx - b.r * 0.3, by - b.r * 0.3, b.r * 0.25, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const sandY = h * 0.92;
+  ctx.lineCap = "round";
+  for (const p of seaPlants) {
+    const sway = Math.sin(bgTime * 1.5 + p.phase);
+    if (p.coral) {
+      ctx.fillStyle = "#ff8fb1";
+      ctx.beginPath();
+      ctx.arc(p.x, sandY - 10, 16, 0, Math.PI * 2);
+      ctx.arc(p.x + 14, sandY - 18, 12, 0, Math.PI * 2);
+      ctx.arc(p.x - 12, sandY - 16, 11, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 9;
+      ctx.beginPath();
+      ctx.moveTo(p.x, sandY + 8);
+      ctx.quadraticCurveTo(p.x + sway * 16, sandY - p.h * 0.5, p.x + sway * 28, sandY - p.h);
+      ctx.stroke();
+    }
+  }
+
+  ctx.fillStyle = "#f4d59a";
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  for (let x = 0; x <= w + 30; x += 30) {
+    ctx.lineTo(x, sandY + Math.sin(x * 0.02) * 8);
+  }
+  ctx.lineTo(w, h);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  for (let x = 0; x <= w + 20; x += 20) {
+    ctx.lineTo(x, 14 + Math.sin(x * 0.03 + bgTime * 2) * 6);
+  }
+  ctx.lineTo(w, 0);
+  ctx.closePath();
+  ctx.fill();
 }
 
 // ---- MEME CATS (original pixel art inspired by classic cat memes) ----
@@ -593,7 +730,6 @@ function drawBgMemes() {
     drawPixelSprite3D(ctx, def.grid, def.palette, def.ps, 4, tilt);
     ctx.restore();
 
-    // caption bubble
     ctx.font = "600 15px Fredoka, sans-serif";
     const tw = ctx.measureText(def.caption).width;
     const bw = tw + 24;
@@ -619,6 +755,164 @@ function drawBgMemes() {
   }
 }
 
+// ---- MOCKING RAT (pops up when you slash a bomb) ----
+
+// K = outline, B = fur, P = ears/nose, W = teeth, M = mouth inside, T = tongue
+const MOCK_RAT_GRID = [
+  ".KK......KK.",
+  "KPPK....KPPK",
+  "KPPKKKKKKPPK",
+  ".KBBBBBBBBK.",
+  "KBBKKBBKKBBK",
+  "KBBBBBBBBBBK",
+  "KBBBBPPBBBBK",
+  "KBBKKKKKKBBK",
+  "KBBKWWWWKBBK",
+  ".KBKMMMMKBK.",
+  ".KBKTTTTKBK.",
+  "..KKKKKKKK.."
+];
+const MOCK_RAT_PALETTE = {
+  K: "#1a1a1a", B: "#a8a8b8", P: "#ff9eb5",
+  W: "#ffffff", M: "#5a1a2a", T: "#ff6b8b"
+};
+
+const MOCK_LINES = [
+  "Nice slash, genius!",
+  "BOOM! Squeak-squeak-HAHA!",
+  "You sliced the BOMB?!",
+  "Is that all you've got, kitty?",
+  "Rats: 1    Cats: 0",
+  "Even my grandma rat saw that!",
+  "Cheese for me, boom for you!",
+  "Meow-ch! That looked painful!"
+];
+
+function triggerMockRat() {
+  mockRat = {
+    side: Math.random() < 0.5 ? "left" : "right",
+    age: 0,
+    duration: 2600,
+    haTimer: 250,
+    text: MOCK_LINES[Math.floor(Math.random() * MOCK_LINES.length)]
+  };
+  playMockSound();
+}
+
+function getMockX(m) {
+  return m.side === "left" ? canvas.width * 0.17 : canvas.width * 0.83;
+}
+
+function easeOutBack(t) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+
+function getMockPop(m) {
+  const IN = 380, OUT = 380;
+  if (m.age < IN) return easeOutBack(m.age / IN);
+  if (m.age > m.duration - OUT) return Math.max(0, (m.duration - m.age) / OUT);
+  return 1;
+}
+
+function updateMockRat(dt) {
+  if (!mockRat) return;
+  const m = mockRat;
+  m.age += dt;
+  m.haTimer -= dt;
+
+  if (m.haTimer <= 0 && m.age < m.duration - 500) {
+    m.haTimer = 380;
+    addFloatingText(
+      getMockX(m) + (Math.random() - 0.5) * 160,
+      canvas.height - 230 - Math.random() * 50,
+      "HA!", "#ffffff", 26, 0.025
+    );
+    playTone({ freq: 1300 + Math.random() * 400, freqEnd: 900, duration: 0.08, type: "triangle", volume: 0.08 });
+  }
+
+  if (m.age >= m.duration) mockRat = null;
+}
+
+function drawMockRat() {
+  if (!mockRat) return;
+  const m = mockRat;
+  const pop = getMockPop(m);
+  if (pop <= 0.001) return;
+
+  const ps = Math.max(9, Math.min(15, canvas.width / 100));
+  const spriteW = MOCK_RAT_GRID[0].length * ps;
+  const spriteH = MOCK_RAT_GRID.length * ps;
+
+  const x = getMockX(m);
+  const yUp = canvas.height - spriteH / 2 - 24;
+  const yDown = canvas.height + spriteH / 2 + 60;
+  const laugh = Math.abs(Math.sin(m.age * 0.04));
+  const y = yDown + (yUp - yDown) * pop - laugh * 10 * Math.min(pop, 1);
+  const rot = Math.sin(m.age * 0.03) * 0.14;
+
+  // the rat
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+
+  // whiskers (drawn first so the face covers their inner ends)
+  ctx.strokeStyle = "#1a1a1a";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  const noseY = -spriteH / 2 + 6.5 * ps;
+  for (const side of [-1, 1]) {
+    for (let i = -1; i <= 1; i++) {
+      ctx.beginPath();
+      ctx.moveTo(side * spriteW * 0.22, noseY);
+      ctx.lineTo(side * (spriteW / 2 + ps * 2.6), noseY + i * ps * 0.9);
+      ctx.stroke();
+    }
+  }
+
+  drawPixelSprite3D(ctx, MOCK_RAT_GRID, MOCK_RAT_PALETTE, ps, 4, rot);
+  ctx.restore();
+
+  // speech bubble
+  ctx.save();
+  ctx.font = "bold 18px Fredoka, sans-serif";
+  const tw = ctx.measureText(m.text).width;
+  const bw = tw + 36;
+  const bh = 38;
+  const cx = Math.max(bw / 2 + 12, Math.min(canvas.width - bw / 2 - 12, x));
+  const cy = y - spriteH / 2 - 44;
+
+  ctx.translate(cx, cy);
+  ctx.scale(Math.min(pop, 1.1), Math.min(pop, 1.1));
+
+  ctx.fillStyle = "#ffffff";
+  ctx.strokeStyle = "#ff7aa8";
+  ctx.lineWidth = 3;
+  roundedRectPath(-bw / 2, -bh / 2, bw, bh, 14);
+  ctx.fill();
+  ctx.stroke();
+
+  // little tail pointing at the rat
+  const tailX = Math.max(-bw / 2 + 22, Math.min(bw / 2 - 22, x - cx));
+  ctx.beginPath();
+  ctx.moveTo(tailX - 9, bh / 2 - 1);
+  ctx.lineTo(tailX, bh / 2 + 13);
+  ctx.lineTo(tailX + 9, bh / 2 - 1);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // cover the seam between bubble and tail
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(tailX - 8, bh / 2 - 4, 16, 5);
+
+  ctx.fillStyle = "#6a3a8a";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(m.text, 0, 1);
+  ctx.restore();
+}
+
 // ---- GAME STATE MANAGEMENT ----
 
 function stopSpawning() {
@@ -637,19 +931,32 @@ function resetGame() {
   floatingTexts = [];
   gameOver = false;
   flashAlpha = 0;
+  shakeTime = 0;
+  mockRat = null;
   comboCount = 0;
   lastSliceTime = 0;
   currentLevel = 0;
+  levelClock = 0;
+  timeSinceBonus = 0;
+  pendingBonus = false;
+  bonus.active = false;
+  bonusFade = 0;
   stopSpawning();
+
+  if (gameOverTimeoutId !== null) {
+    clearTimeout(gameOverTimeoutId);
+    gameOverTimeoutId = null;
+  }
 }
 
 function spawnLoop() {
   if (gameOver) return;
 
-  spawnItem();
-
-  if (currentLevel >= 3 && Math.random() < 0.25) {
+  if (!bonus.active) {
     spawnItem();
+    if (currentLevel >= 3 && Math.random() < 0.25) {
+      spawnItem();
+    }
   }
 
   spawnTimeoutId = setTimeout(spawnLoop, getSpawnDelay());
@@ -658,7 +965,6 @@ function spawnLoop() {
 function startGame() {
   started = true;
   getAudioCtx().resume();
-  gameStartTime = Date.now();
   currentLevel = 0;
   document.getElementById("menuOverlay").classList.add("hidden");
   document.getElementById("gameOverOverlay").classList.add("hidden");
@@ -743,8 +1049,91 @@ const LIFE_GRID = [
 ];
 const LIFE_PALETTE = { R: "#ff4d6d" };
 
+// ---- FISH (bonus round) ----
+
+// K = outline, B = body, L = belly, F = fins/tail, W = eye. Tail on the left, facing right.
+const FISH_GRID_R = [
+  "...KKKK....",
+  ".K.KBBBBK..",
+  "KFKBBBBBBK.",
+  "KFFBBBBWKBK",
+  "KFKBLLLLBK.",
+  ".K.KLLLLK..",
+  "...KKKK...."
+];
+const FISH_GRID_L = FISH_GRID_R.map(row => row.split("").reverse().join(""));
+
+const FISH_TYPES = {
+  small: {
+    palette: { K: "#1a1a1a", B: "#ff9f6b", L: "#ffe0c2", F: "#ff7a45", W: "#ffffff" },
+    ps: 4, speed: 3.6, points: 10, weight: 5
+  },
+  blue: {
+    palette: { K: "#1a1a1a", B: "#5ec8ff", L: "#d6f3ff", F: "#3a9be0", W: "#ffffff" },
+    ps: 5, speed: 2.6, points: 15, weight: 3
+  },
+  pink: {
+    palette: { K: "#1a1a1a", B: "#ff8fc7", L: "#ffd6ec", F: "#e0559f", W: "#ffffff" },
+    ps: 5, speed: 3.0, points: 20, weight: 2
+  },
+  golden: {
+    palette: { K: "#1a1a1a", B: "#ffd23f", L: "#fff3b0", F: "#ffb300", W: "#ffffff" },
+    ps: 6, speed: 4.8, points: 50, weight: 1
+  }
+};
+
+function spawnFish() {
+  const keys = Object.keys(FISH_TYPES);
+  const total = keys.reduce((sum, k) => sum + FISH_TYPES[k].weight, 0);
+  let r = Math.random() * total;
+  let type = keys[0];
+  for (const k of keys) {
+    r -= FISH_TYPES[k].weight;
+    if (r <= 0) { type = k; break; }
+  }
+
+  const def = FISH_TYPES[type];
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  const baseY = canvas.height * (0.16 + Math.random() * 0.66);
+
+  items.push({
+    kind: "fish",
+    type,
+    dir,
+    x: dir === 1 ? -80 : canvas.width + 80,
+    baseY,
+    y: baseY,
+    speed: def.speed * (0.85 + Math.random() * 0.3),
+    amp: 14 + Math.random() * 34,
+    freq: 0.03 + Math.random() * 0.03,
+    phase: Math.random() * Math.PI * 2,
+    age: 0,
+    radius: def.ps * 5
+  });
+}
+
 function spawnItem() {
   if (gameOver) return;
+
+  // golden bonus fish: rare, but guaranteed if it's been a while
+  const hasBonusFish = items.some(i => i.kind === "bonusfish");
+  const wantBonus = !hasBonusFish &&
+    (timeSinceBonus > BONUS_FORCE_MS || (currentLevel >= 1 && Math.random() < 0.03));
+
+  if (wantBonus) {
+    timeSinceBonus = 0;
+    items.push({
+      kind: "bonusfish",
+      x: canvas.width * (0.15 + Math.random() * 0.7),
+      y: canvas.height + 30,
+      vx: (Math.random() - 0.5) * 3,
+      vy: -(15 + Math.random() * 3),
+      radius: 38,
+      rot: 0,
+      spin: (Math.random() - 0.5) * 0.05
+    });
+    return;
+  }
 
   const r = Math.random();
   const bombChance = getBombChance();
@@ -792,12 +1181,62 @@ function spawnItem() {
   }
 }
 
+// ---- BONUS ROUND CONTROL ----
+
+function startBonus() {
+  bonus.active = true;
+  bonus.timeLeft = BONUS_DURATION;
+  bonus.caught = 0;
+  bonus.points = 0;
+  bonus.spawnTimer = 200;
+
+  items = [];   // clear rats/bombs so nothing hurts you during the bonus
+  trail = [];
+  timeSinceBonus = 0;
+
+  for (let i = 0; i < 3; i++) spawnFish();
+
+  addFloatingText(canvas.width / 2, canvas.height * 0.30, "BONUS ROUND!", "#7ff3ff", 56, 0.012);
+  addFloatingText(canvas.width / 2, canvas.height * 0.30 + 52, "Slash the fish!", "#ffffff", 28, 0.012);
+  playBonusStartSound();
+}
+
+function endBonus() {
+  bonus.active = false;
+  items = [];
+
+  const gotLife = bonus.caught >= 12 && lives < 5;
+  if (gotLife) lives++;
+
+  const cx = canvas.width / 2;
+  const cy = canvas.height * 0.36;
+  const pct = Math.round((bonus.caught * FISH_LEVEL_BOOST) / LEVEL_DURATION * 100);
+
+  addFloatingText(cx, cy, "BONUS COMPLETE!", "#7ff3ff", 46, 0.008);
+  addFloatingText(cx, cy + 48, bonus.caught + " fish  •  +" + bonus.points + " pts", "#ffffff", 28, 0.008);
+  addFloatingText(cx, cy + 88, "Level progress +" + pct + "%", "#ffe066", 24, 0.008);
+  if (gotLife) addFloatingText(cx, cy + 124, "+1 LIFE!", "#ff9ac2", 26, 0.008);
+
+  playLevelUpSound();
+}
+
 function triggerGameOver(fromBomb) {
   gameOver = true;
   stopSpawning();
-  document.getElementById("finalScoreText").textContent =
-    (fromBomb ? "💥 Boom! " : "") + "Final Score: " + score + "  •  Level " + (currentLevel + 1);
-  document.getElementById("gameOverOverlay").classList.remove("hidden");
+
+  const showOverlay = () => {
+    if (!gameOver) return;
+    document.getElementById("finalScoreText").textContent =
+      (fromBomb ? "💥 Boom! " : "") + "Final Score: " + score + "  •  Level " + (currentLevel + 1);
+    document.getElementById("gameOverOverlay").classList.remove("hidden");
+  };
+
+  if (fromBomb) {
+    // let the rat finish laughing before the Game Over screen appears
+    gameOverTimeoutId = setTimeout(showOverlay, 2300);
+  } else {
+    showOverlay();
+  }
 }
 
 function updateLevel() {
@@ -809,19 +1248,41 @@ function updateLevel() {
   }
 }
 
-function update() {
+function update(dt) {
   if (!started || gameOver) return;
+
+  if (bonus.active) {
+    bonus.timeLeft -= dt;
+    bonus.spawnTimer -= dt;
+    if (bonus.spawnTimer <= 0) {
+      spawnFish();
+      bonus.spawnTimer = 280 + Math.random() * 260;
+    }
+    if (bonus.timeLeft <= 0) endBonus();
+  } else {
+    levelClock += dt;
+    timeSinceBonus += dt;
+  }
 
   updateLevel();
 
   for (const item of items) {
-    item.vy += GRAVITY;
-    item.x += item.vx;
-    item.y += item.vy;
-    item.rot += item.spin;
+    if (item.kind === "fish") {
+      item.age++;
+      item.x += item.dir * item.speed;
+      item.y = item.baseY + Math.sin(item.age * item.freq + item.phase) * item.amp;
+    } else {
+      item.vy += GRAVITY;
+      item.x += item.vx;
+      item.y += item.vy;
+      item.rot += item.spin;
+    }
   }
 
   items = items.filter(item => {
+    if (item.kind === "fish") {
+      return item.x > -120 && item.x < canvas.width + 120;
+    }
     if (item.y >= canvas.height + 60) {
       if (item.kind === "rat") {
         lives--;
@@ -835,6 +1296,12 @@ function update() {
     }
     return true;
   });
+}
+
+function updateBonusFade() {
+  const target = bonus.active ? 1 : 0;
+  bonusFade += (target - bonusFade) * 0.07;
+  if (Math.abs(target - bonusFade) < 0.01) bonusFade = target;
 }
 
 function updateTrail() {
@@ -857,7 +1324,7 @@ function registerSlice() {
   lastSliceTime = now;
   if (comboCount > 1) {
     playComboSound(comboCount);
-    addFloatingText(canvas.width / 2, 110, comboCount + "x COMBO!", "#ffe066", 30);
+    addFloatingText(canvas.width / 2, 150, comboCount + "x COMBO!", "#ffe066", 30);
   }
   return comboCount;
 }
@@ -875,21 +1342,45 @@ function checkSlashes() {
       if (item.kind === "rat") {
         const combo = registerSlice();
         const base = RAT_TYPES[item.type].points;
-        const bonus = base + (combo - 1) * 5;
-        score += bonus;
+        const bonusPts = base + (combo - 1) * 5;
+        score += bonusPts;
         spawnParticles(item.x, item.y, RAT_TYPES[item.type].palette.B, 10, 5);
-        addFloatingText(item.x, item.y, "+" + bonus, "#ffffff", 22);
+        addFloatingText(item.x, item.y, "+" + bonusPts, "#ffffff", 22);
         playSliceSound();
       } else if (item.kind === "bomb") {
+        // a bomb now costs a life instead of ending the game outright
         spawnParticles(item.x, item.y, "#ff6b35", 24, 7);
         triggerFlash();
+        shakeTime = 400;
         playBombSound();
-        triggerGameOver(true);
+        comboCount = 0;
+        lastSliceTime = 0;
+        lives--;
+        addFloatingText(item.x, item.y, "-1 LIFE", "#ff4d4d", 30);
+        triggerMockRat();
+        if (lives <= 0) {
+          lives = 0;
+          triggerGameOver(true);
+        }
       } else if (item.kind === "life") {
         lives = Math.min(lives + 1, 5);
         spawnParticles(item.x, item.y, "#ff4d6d", 12, 4);
         addFloatingText(item.x, item.y, "+1 LIFE", "#ff7a9a", 22);
         playExtraLifeSound();
+      } else if (item.kind === "bonusfish") {
+        spawnParticles(item.x, item.y, "#7ff3ff", 22, 6);
+        if (!bonus.active) pendingBonus = true;
+      } else if (item.kind === "fish") {
+        const combo = registerSlice();
+        const def = FISH_TYPES[item.type];
+        const pts = def.points + (combo - 1) * 3;
+        score += pts;
+        bonus.points += pts;
+        bonus.caught++;
+        levelClock += FISH_LEVEL_BOOST;
+        spawnParticles(item.x, item.y, "#bfefff", 12, 4);
+        addFloatingText(item.x, item.y, "+" + pts, "#ffffff", 22);
+        playFishSound();
       }
 
       return false;
@@ -940,14 +1431,14 @@ function drawParticles() {
 
 // ---- FLOATING TEXT ----
 
-function addFloatingText(x, y, text, color, size) {
-  floatingTexts.push({ x, y, text, color, size, life: 1 });
+function addFloatingText(x, y, text, color, size, decay = 0.02) {
+  floatingTexts.push({ x, y, text, color, size, decay, life: 1 });
 }
 
 function updateFloatingTexts() {
   for (const t of floatingTexts) {
-    t.y -= 0.6;
-    t.life -= 0.02;
+    t.y -= t.decay * 30;
+    t.life -= t.decay;
   }
   floatingTexts = floatingTexts.filter(t => t.life > 0);
 }
@@ -964,8 +1455,9 @@ function drawOutlinedText(text, x, y, size, color) {
 
 function drawFloatingTexts() {
   ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
   for (const t of floatingTexts) {
-    ctx.globalAlpha = Math.max(t.life, 0);
+    ctx.globalAlpha = Math.max(Math.min(t.life * 2, 1), 0);
     drawOutlinedText(t.text, t.x, t.y, t.size, t.color);
   }
   ctx.globalAlpha = 1;
@@ -1057,6 +1549,35 @@ function drawLifeItem(item) {
   ctx.restore();
 }
 
+function drawFish(item) {
+  const def = FISH_TYPES[item.type];
+  const grid = item.dir === 1 ? FISH_GRID_R : FISH_GRID_L;
+  const tilt = Math.cos(item.age * item.freq + item.phase) * 0.25 * item.dir;
+
+  ctx.save();
+  ctx.translate(item.x, item.y);
+  ctx.rotate(tilt);
+  drawPixelSprite3D(ctx, grid, def.palette, def.ps, 3, tilt);
+  ctx.restore();
+}
+
+function drawBonusFishItem(item) {
+  const def = FISH_TYPES.golden;
+  const grid = item.vx >= 0 ? FISH_GRID_R : FISH_GRID_L;
+  const pulse = 10 + Math.sin(bgTime * 8) * 6;
+
+  ctx.save();
+  ctx.translate(item.x, item.y);
+  ctx.rotate(item.rot);
+  ctx.shadowColor = "#7ff3ff";
+  ctx.shadowBlur = pulse + 10;
+  drawPixelSprite3D(ctx, grid, def.palette, 7, 4, item.rot);
+  ctx.restore();
+
+  ctx.textAlign = "center";
+  drawOutlinedText("BONUS", item.x, item.y - item.radius - 18, 16, "#7ff3ff");
+}
+
 function drawTrail() {
   if (trail.length < 2) return;
 
@@ -1081,8 +1602,12 @@ function drawTrail() {
   ctx.restore();
 }
 
+// ---- HUD ----
+
 function drawHUD() {
   if (!started) return;
+
+  ctx.textBaseline = "alphabetic";
 
   ctx.textAlign = "left";
   drawOutlinedText("Score: " + score, 20, 42, 28, "#ffffff");
@@ -1092,33 +1617,122 @@ function drawHUD() {
 
   ctx.textAlign = "right";
   drawOutlinedText("Lives: " + lives, canvas.width - 20, 42, 28, "#ff9ac2");
+
+  // level progress bar (fills with time AND with bonus fish)
+  const lbw = 180, lbh = 10;
+  const lbx = canvas.width / 2 - lbw / 2;
+  const lby = 54;
+  const prog = (levelClock % LEVEL_DURATION) / LEVEL_DURATION;
+
+  ctx.fillStyle = "rgba(70, 30, 110, 0.5)";
+  roundedRectPath(lbx, lby, lbw, lbh, 5);
+  ctx.fill();
+  if (prog > 0.04) {
+    ctx.fillStyle = "#ffe066";
+    roundedRectPath(lbx, lby, lbw * prog, lbh, 5);
+    ctx.fill();
+  }
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  roundedRectPath(lbx, lby, lbw, lbh, 5);
+  ctx.stroke();
 }
 
-function draw() {
-  drawBackground();
-  drawBgMemes();
+function drawBonusHUD() {
+  if (!bonus.active) return;
 
-  for (const item of items) drawItemShadow(item);
+  const w = canvas.width;
+  const bw = 340, bh = 14;
+  const x = w / 2 - bw / 2;
+  const y = 100;
+
+  ctx.textAlign = "center";
+  drawOutlinedText("BONUS FISH FRENZY  •  " + bonus.caught + " caught", w / 2, y - 10, 20, "#7ff3ff");
+
+  ctx.fillStyle = "rgba(20, 40, 110, 0.55)";
+  roundedRectPath(x, y, bw, bh, 7);
+  ctx.fill();
+
+  const frac = Math.max(0, bonus.timeLeft / BONUS_DURATION);
+  if (frac > 0.03) {
+    ctx.fillStyle = frac > 0.25 ? "#7ff3ff" : "#ff7a9a";
+    roundedRectPath(x, y, bw * frac, bh, 7);
+    ctx.fill();
+  }
+
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  roundedRectPath(x, y, bw, bh, 7);
+  ctx.stroke();
+}
+
+// ---- MAIN DRAW ----
+
+function draw() {
+  ctx.save();
+
+  // screen shake after a bomb
+  if (shakeTime > 0) {
+    const mag = shakeTime / 40;
+    ctx.translate((Math.random() - 0.5) * mag, (Math.random() - 0.5) * mag);
+  }
+
+  drawBackground();
+
+  if (bonusFade > 0.01) {
+    ctx.save();
+    ctx.globalAlpha = bonusFade;
+    drawUnderwater();
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.globalAlpha = 1 - bonusFade;
+  drawBgMemes();
+  ctx.restore();
+
+  for (const item of items) {
+    if (item.kind !== "fish") drawItemShadow(item);
+  }
 
   for (const item of items) {
     if (item.kind === "rat") drawRat(item);
     else if (item.kind === "bomb") drawBomb(item);
     else if (item.kind === "life") drawLifeItem(item);
+    else if (item.kind === "fish") drawFish(item);
+    else if (item.kind === "bonusfish") drawBonusFishItem(item);
   }
 
+  drawMockRat();
   drawParticles();
   drawTrail();
   drawFloatingTexts();
   drawHUD();
+  drawBonusHUD();
   drawFlash();
+
+  ctx.restore();
 }
 
 function gameLoop() {
-  bgTime = performance.now() / 1000;
+  const now = performance.now();
+  const dt = Math.min(now - lastFrameTime, 100);
+  lastFrameTime = now;
+  bgTime = now / 1000;
+
   updateBgMemes();
   updateTrail();
-  update();
+  update(dt);
   checkSlashes();
+
+  if (pendingBonus) {
+    pendingBonus = false;
+    if (!bonus.active && !gameOver) startBonus();
+  }
+
+  updateBonusFade();
+  updateMockRat(dt);
+  if (shakeTime > 0) shakeTime = Math.max(0, shakeTime - dt);
   updateParticles();
   updateFloatingTexts();
   updateFlash();
@@ -1127,3 +1741,4 @@ function gameLoop() {
 }
 
 gameLoop();
+
